@@ -1,18 +1,55 @@
 #!/bin/bash
-# Check if a Go package exists as a dependency across submodules and release branches.
+# Check if Go packages exist as dependencies across submodules and release branches.
+# Accepts multiple packages/CVEs in a single invocation.
 #
 # Usage:
-#   ./hack/check-go-dep.sh golang.org/x/image
-#   ./hack/check-go-dep.sh CVE-2026-33813
-#   ./hack/check-go-dep.sh https://www.cve.org/CVERecord?id=CVE-2026-33813
+#   ./hack/check-go-dep.sh golang.org/x/image golang.org/x/net
+#   ./hack/check-go-dep.sh CVE-2026-33813 CVE-2024-45338
+#   ./hack/check-go-dep.sh CVE-2026-33813 golang.org/x/image
 #   ./hack/check-go-dep.sh --branches release-0.14,release-0.15 golang.org/x/net
+#   ./hack/check-go-dep.sh --version 0.15 golang.org/x/image
 #   ./hack/check-go-dep.sh --acm 2.16.0 golang.org/x/image
 #   ./hack/check-go-dep.sh --all golang.org/x/net
 
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-DEFAULT_BRANCHES="release-0.14,release-0.15,release-0.16"
+
+# Auto-detect active release branches: those that have .tekton/ on upstream
+detect_active_branches() {
+    local branches=()
+    for branch in $(git -C "$REPO_ROOT" branch -r 2>/dev/null | grep 'upstream/release-' | sed 's|.*upstream/||' | sort -V); do
+        if [[ -n "$(git -C "$REPO_ROOT" ls-tree "upstream/${branch}" .tekton/ 2>/dev/null)" ]]; then
+            branches+=("$branch")
+        fi
+    done
+    if [[ ${#branches[@]} -gt 0 ]]; then
+        echo "${branches[*]}" | tr ' ' ','
+    else
+        echo "release-0.14,release-0.15,release-0.16"
+    fi
+}
+
+# Resolve a version input to a release branch name.
+# Accepts: "0.15", "0.14.2", "release-0.15", or ACM "2.16.0"
+resolve_version_to_branch() {
+    local ver="$1"
+    # Already a branch name
+    if [[ "$ver" =~ ^release- ]]; then
+        echo "$ver"
+        return
+    fi
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    if [[ "$major" -ge 2 ]]; then
+        # ACM version: X.Y.Z → release-(X-2).(Y-1)
+        echo "release-$((major - 2)).$((minor - 1))"
+    else
+        # VolSync version: 0.15 or 0.15.2 → release-0.15
+        echo "release-${major}.${minor}"
+    fi
+}
 
 # Submodules and their go.mod paths (label:submodule_dir:gomod_path_inside_submodule)
 SUBMODULE_GOMODS=(
@@ -69,19 +106,19 @@ is_version_affected() {
 
 # ── input parsing ────────────────────────────────────────────────────────────
 
-parse_input() {
+# Classify a single input and add it to the appropriate list.
+# Called once per positional argument.
+classify_input() {
     local input="$1"
 
     if [[ "$input" =~ ^https?://.*CVE-[0-9]{4}-[0-9]+ ]]; then
-        # CVE URL — extract the CVE ID
-        CVE_ID=$(echo "$input" | grep -oP 'CVE-[0-9]{4}-[0-9]+')
-        INPUT_MODE="cve"
+        local cve_id
+        cve_id=$(echo "$input" | grep -oP 'CVE-[0-9]{4}-[0-9]+')
+        CVE_IDS+=("$cve_id")
     elif [[ "$input" =~ ^CVE-[0-9]{4}-[0-9]+$ ]]; then
-        CVE_ID="$input"
-        INPUT_MODE="cve"
+        CVE_IDS+=("$input")
     else
-        PACKAGES=("$input")
-        INPUT_MODE="package"
+        PLAIN_PACKAGES+=("$input")
     fi
 }
 
@@ -301,95 +338,70 @@ assess_version() {
 
 usage() {
     cat <<'USAGE'
-Usage: check-go-dep.sh [OPTIONS] <package-or-cve>
+Usage: check-go-dep.sh [OPTIONS] <package-or-cve> [<package-or-cve> ...]
+
+Checks whether Go packages exist as dependencies across submodules and
+release branches, including CVE-patches go.mod overrides. Accepts multiple
+packages and/or CVEs in a single invocation.
 
 Arguments:
-  package-or-cve    Go package name, CVE ID, or CVE URL
+  package-or-cve    Go package name, CVE ID, or CVE URL (one or more)
                     Examples:
                       golang.org/x/image
                       CVE-2026-33813
                       https://www.cve.org/CVERecord?id=CVE-2026-33813
 
-Options:
-  --branches LIST   Comma-separated release branches (default: release-0.14,release-0.15,release-0.16)
+Branch selection (default: auto-detect active branches via .tekton/):
+  --version LIST    Comma-separated VolSync or ACM versions
+                      VolSync: 0.14, 0.15.2 → release-0.14, release-0.15
+                      ACM:     2.16.0       → release-0.15 (X-2, Y-1)
+  --branches LIST   Comma-separated release branch names
   --all             Check all upstream/release-* branches
-  --acm VERSION     Convert ACM version to release branch (e.g., 2.16.0 → release-0.15)
+
+Other options:
   --no-fetch        Skip fetching upstream and submodules
   -h, --help        Show this help
+
+Workflow:
+  This script finds WHERE vulnerable deps are. To determine IF they
+  actually matter, follow up with:
+    ./hack/cve-triage.sh <CVE-ID>
+
+Example output (package mode):
+
+  --- release-0.15 ---
+    volsync                  not found
+    rclone                   v0.32.0 (indirect)
+    syncthing                not found
+    CVE-patch/rclone         v0.32.0 (indirect)
+
+Example output (CVE mode):
+
+  === CVE-2024-45338 ===
+  Package: golang.org/x/net/html
+    Affected: [0, 0.33.0)
+
+  --- release-0.15 ---
+    volsync                  v0.49.0 (indirect)   ✓ FIXED
+    rclone                   v0.47.0 (direct)     ✓ FIXED
+    CVE-patch/rclone         v0.48.0 (direct)     ✓ FIXED
+
+  If any submodule shows ⚠ VULNERABLE, run:
+    ./hack/cve-triage.sh --submodule <name> <CVE-ID>
 USAGE
     exit 0
 }
 
-main() {
-    check_deps
+# ── per-input processing ───────────────────────────────────────────────────
 
-    local branches_csv="$DEFAULT_BRANCHES"
-    local do_fetch=true
-    local positional=""
+check_branches_for_packages() {
+    local input_mode="$1"
+    shift
+    local -a pkgs=("$@")
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --branches)
-                branches_csv="$2"
-                shift 2
-                ;;
-            --all)
-                branches_csv=$(git -C "$REPO_ROOT" branch -r | grep 'upstream/release-' | sed 's|.*upstream/||' | sort -V | tr '\n' ',')
-                branches_csv="${branches_csv%,}"
-                shift
-                ;;
-            --acm)
-                local acm_ver="$2"
-                local acm_major acm_minor
-                acm_major=$(echo "$acm_ver" | cut -d. -f1)
-                acm_minor=$(echo "$acm_ver" | cut -d. -f2)
-                branches_csv="release-$((acm_major - 2)).$((acm_minor - 1))"
-                shift 2
-                ;;
-            --no-fetch)
-                do_fetch=false
-                shift
-                ;;
-            -h|--help)
-                usage
-                ;;
-            -*)
-                die "Unknown option: $1"
-                ;;
-            *)
-                positional="$1"
-                shift
-                ;;
-        esac
-    done
-
-    [[ -n "$positional" ]] || die "Missing argument. Run with --help for usage."
-
-    parse_input "$positional"
-
-    # Fetch upstream and submodules
-    if $do_fetch; then
-        echo "Fetching upstream and submodules..."
-        git -C "$REPO_ROOT" fetch upstream --quiet 2>/dev/null || echo "  Warning: failed to fetch upstream"
-        for sub in volsync rclone syncthing diskrsync; do
-            git -C "${REPO_ROOT}/${sub}" fetch --quiet 2>/dev/null || true
-        done
-        echo ""
-    fi
-
-    # CVE mode: fetch CVE data
-    if [[ "$INPUT_MODE" == "cve" ]]; then
-        fetch_cve_data "$CVE_ID"
-    fi
-
-    # Parse branches
-    IFS=',' read -ra BRANCHES <<< "$branches_csv"
-
-    # Check each branch
     for branch in "${BRANCHES[@]}"; do
-        branch=$(echo "$branch" | xargs)  # trim whitespace
+        branch=$(echo "$branch" | xargs)
 
-        # Verify branch exists
         if ! git -C "$REPO_ROOT" rev-parse "upstream/${branch}" >/dev/null 2>&1; then
             echo "--- ${branch} --- (NOT FOUND on upstream, skipping)"
             echo ""
@@ -398,8 +410,11 @@ main() {
 
         echo "--- ${branch} ---"
 
-        for pkg in "${PACKAGES[@]}"; do
-            # Check submodule go.mods
+        for pkg in "${pkgs[@]}"; do
+            if [[ ${#pkgs[@]} -gt 1 ]]; then
+                printf "  [%s]\n" "$pkg"
+            fi
+
             for entry in "${SUBMODULE_GOMODS[@]}"; do
                 IFS=':' read -r label submod_dir gomod_path <<< "$entry"
 
@@ -415,7 +430,7 @@ main() {
 
                 if [[ -n "$result" ]]; then
                     local assessment=""
-                    if [[ "$INPUT_MODE" == "cve" ]]; then
+                    if [[ "$input_mode" == "cve" ]]; then
                         assessment=$(assess_version "$pkg" "$result")
                     fi
                     printf "  %-24s %s%s\n" "$label" "$result" "$assessment"
@@ -424,7 +439,6 @@ main() {
                 fi
             done
 
-            # Check CVE-patches go.mods
             for entry in "${PATCH_GOMODS[@]}"; do
                 IFS=':' read -r label path <<< "$entry"
 
@@ -440,7 +454,7 @@ main() {
 
                 if [[ -n "$result" ]]; then
                     local assessment=""
-                    if [[ "$INPUT_MODE" == "cve" ]]; then
+                    if [[ "$input_mode" == "cve" ]]; then
                         assessment=$(assess_version "$pkg" "$result")
                     fi
                     printf "  %-24s %s%s\n" "$label" "$result" "$assessment"
@@ -452,6 +466,106 @@ main() {
 
         echo ""
     done
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    check_deps
+
+    local branches_csv=""
+    local do_fetch=true
+    local -a positionals=()
+
+    CVE_IDS=()
+    PLAIN_PACKAGES=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --branches)
+                branches_csv="$2"
+                shift 2
+                ;;
+            --version)
+                local versions_input="$2"
+                local -a resolved=()
+                IFS=',' read -ra vers <<< "$versions_input"
+                for v in "${vers[@]}"; do
+                    resolved+=("$(resolve_version_to_branch "$(echo "$v" | xargs)")")
+                done
+                branches_csv=$(IFS=','; echo "${resolved[*]}")
+                shift 2
+                ;;
+            --all)
+                branches_csv=$(git -C "$REPO_ROOT" branch -r | grep 'upstream/release-' | sed 's|.*upstream/||' | sort -V | tr '\n' ',')
+                branches_csv="${branches_csv%,}"
+                shift
+                ;;
+            --acm)
+                branches_csv=$(resolve_version_to_branch "$2")
+                shift 2
+                ;;
+            --no-fetch)
+                do_fetch=false
+                shift
+                ;;
+            -h|--help)
+                usage
+                ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
+            *)
+                positionals+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    [[ ${#positionals[@]} -gt 0 ]] || die "Missing argument(s). Run with --help for usage."
+
+    # Classify all inputs
+    for arg in "${positionals[@]}"; do
+        classify_input "$arg"
+    done
+
+    # Resolve default branches if none specified
+    if [[ -z "$branches_csv" ]]; then
+        branches_csv=$(detect_active_branches)
+    fi
+    IFS=',' read -ra BRANCHES <<< "$branches_csv"
+    echo "Branches: ${BRANCHES[*]}"
+
+    # Fetch upstream and submodules
+    if $do_fetch; then
+        echo "Fetching upstream and submodules..."
+        git -C "$REPO_ROOT" fetch upstream --quiet 2>/dev/null || echo "  Warning: failed to fetch upstream"
+        for sub in volsync rclone syncthing diskrsync; do
+            git -C "${REPO_ROOT}/${sub}" fetch --quiet 2>/dev/null || true
+        done
+        echo ""
+    fi
+
+    # Process CVE inputs
+    for cve_id in "${CVE_IDS[@]}"; do
+        INPUT_MODE="cve"
+        PACKAGES=()
+        declare -g -A CVE_RANGES=()
+
+        fetch_cve_data "$cve_id"
+        check_branches_for_packages "cve" "${PACKAGES[@]}"
+
+        # Suggest follow-up
+        echo "  Next step: ./hack/cve-triage.sh ${cve_id}"
+        echo ""
+    done
+
+    # Process plain package inputs
+    if [[ ${#PLAIN_PACKAGES[@]} -gt 0 ]]; then
+        INPUT_MODE="package"
+        PACKAGES=("${PLAIN_PACKAGES[@]}")
+        check_branches_for_packages "package" "${PACKAGES[@]}"
+    fi
 }
 
 main "$@"
