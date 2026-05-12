@@ -198,8 +198,17 @@ fetch_cve_data() {
         CVE_RANGES["$pkg_name"]="$versions_json"
     done
 
+    # Extract description and references for verification
+    local cve_desc
+    cve_desc=$(echo "$CVE_JSON" | jq -r '.containers.cna.descriptions[0].value // empty')
+
     echo ""
     echo "=== ${cve_id} ==="
+
+    if [[ -n "$cve_desc" ]]; then
+        echo "Description: ${cve_desc}"
+    fi
+
     for pkg in "${PACKAGES[@]}"; do
         echo "Package: ${pkg}"
         local ranges="${CVE_RANGES[$pkg]}"
@@ -217,6 +226,17 @@ fetch_cve_data() {
             fi
         done
     done
+
+    # Show references so the user can verify
+    local refs
+    refs=$(echo "$CVE_JSON" | jq -r '.containers.cna.references[]?.url // empty' 2>/dev/null)
+    if [[ -n "$refs" ]]; then
+        echo "References:"
+        while IFS= read -r url; do
+            echo "  - ${url}"
+        done <<< "$refs"
+    fi
+    echo "  - https://www.cve.org/CVERecord?id=${cve_id}"
     echo ""
 }
 
