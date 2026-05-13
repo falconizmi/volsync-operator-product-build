@@ -77,6 +77,13 @@ Steps to locally update rpms lockfile:
 
 
 0. Intial setup of [rpm-lockfile-prototype tool](https://github.com/konflux-ci/rpm-lockfile-prototype)
+
+   A [Containerfile](Containerfile) is provided to build the tool image locally:
+
+   ```bash
+   podman build -t localhost/rpm-lockfile-prototype:latest -f Containerfile .
+   ```
+
 1. Update the rpms.in.yaml inside the project
 1. Check if `$HOME/.docker/config.json` has access to registry.redhat.io
 1. Now run the tool inside the container
@@ -90,3 +97,18 @@ podman run --rm \
   --outfile="${container_dir}/rpms.lock.yaml" \
   "${container_dir}/rpms.in.yaml"
 ```
+
+### Checking RPM lockfile freshness across branches
+
+To check if `rpms.lock.yaml` is up-to-date on active release branches and open PRs,
+run from the `main` branch:
+
+```bash
+./hack/check-rpm-lockfile.sh
+```
+
+This script lives on `main` only. It checks active release branches (those with Tekton pipelines)
+and open PR branches that contain `rpms.lock.yaml` remotely via git worktrees, reporting which
+ones need regeneration.
+
+See [docs/check-rpm-lockfile.md](docs/check-rpm-lockfile.md) for full usage and options.
