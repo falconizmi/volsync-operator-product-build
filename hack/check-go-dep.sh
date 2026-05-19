@@ -14,6 +14,19 @@
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+VERBOSE=false
+
+# ── colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+if [[ ! -t 1 ]]; then
+    RED='' GREEN='' YELLOW='' BOLD='' DIM='' RESET=''
+fi
 
 # Auto-detect active release branches: those that have .tekton/ on upstream
 detect_active_branches() {
@@ -44,7 +57,12 @@ resolve_version_to_branch() {
     minor=$(echo "$ver" | cut -d. -f2)
     if [[ "$major" -ge 2 ]]; then
         # ACM version: X.Y.Z → release-(X-2).(Y-1)
-        echo "release-$((major - 2)).$((minor - 1))"
+        local vs_major=$((major - 2))
+        local vs_minor=$((minor - 1))
+        if [[ "$vs_major" -lt 0 || "$vs_minor" -lt 0 ]]; then
+            die "Cannot map ACM version ${ver} to a VolSync release branch (result: release-${vs_major}.${vs_minor})"
+        fi
+        echo "release-${vs_major}.${vs_minor}"
     else
         # VolSync version: 0.15 or 0.15.2 → release-0.15
         echo "release-${major}.${minor}"
@@ -74,6 +92,9 @@ CVE_API="https://cveawg.mitre.org/api/cve"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+vcmd() { $VERBOSE && echo -e "    $*" || true; }
+vout() { $VERBOSE && echo -e "    ${DIM}→ $*${RESET}" || true; }
+
 check_deps() {
     for cmd in jq curl git; do
         command -v "$cmd" >/dev/null 2>&1 || die "$cmd is required but not found"
@@ -93,6 +114,203 @@ version_le() {
 # Strip leading "v" from version string
 strip_v() {
     echo "${1#v}"
+}
+
+# Stdlib packages have no dot in their first path segment (e.g., crypto/x509, net/http).
+is_stdlib_package() {
+    local pkg="$1"
+    local first_segment="${pkg%%/*}"
+    [[ "$first_segment" != *.* ]]
+}
+
+# Extract Go toolchain version from go.mod content (stdin).
+# Prefers toolchain directive (actual build version) over go directive (minimum version).
+extract_go_version() {
+    local gomod_content
+    gomod_content=$(cat)
+
+    local toolchain_ver
+    toolchain_ver=$(echo "$gomod_content" | grep -Po '^toolchain\s+go\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [[ -n "$toolchain_ver" ]]; then
+        echo "$toolchain_ver"
+        return
+    fi
+
+    local go_ver
+    go_ver=$(echo "$gomod_content" | grep -Po '^go\s+\K[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+    if [[ -n "$go_ver" ]]; then
+        echo "$go_ver"
+        return
+    fi
+}
+
+# Extract builder image reference from Dockerfile content.
+extract_builder_image_ref() {
+    local content="$1"
+    echo "$content" | grep -oP 'brew\.registry\.redhat\.io/rh-osbs/openshift-golang-builder:[^\s]+' | head -1
+}
+
+# Get Go version from builder image labels via skopeo.
+check_builder_image_version() {
+    local image_ref="$1"
+    command -v skopeo >/dev/null 2>&1 || return 1
+    # Strip tag when digest is present: image:tag@sha256:... → image@sha256:...
+    if [[ "$image_ref" == *@sha256:* ]]; then
+        image_ref="${image_ref%%:*}@${image_ref#*@}"
+    fi
+    skopeo inspect --config "docker://${image_ref}" 2>/dev/null \
+        | jq -r '.config.Labels.version // empty' 2>/dev/null \
+        | sed 's/^v//'
+}
+
+# Check builder image Go version for a branch (stdlib CVEs only).
+# Uses git show to read Dockerfile.rhtap, skopeo to inspect the image.
+# Returns via BUILDER_STATUS: "fixed", "vulnerable", or "unknown".
+check_builder_for_branch() {
+    local branch="$1" pkg="$2"
+    BUILDER_STATUS="unknown"
+    BUILDER_VER=""
+    BUILDER_REF=""
+
+    local dockerfile_content
+    dockerfile_content=$(git -C "$REPO_ROOT" show "upstream/${branch}:Dockerfile.rhtap" 2>/dev/null) || return 0
+
+    local builder_ref
+    builder_ref=$(extract_builder_image_ref "$dockerfile_content")
+    [[ -n "$builder_ref" ]] || return 0
+    BUILDER_REF="$builder_ref"
+
+    local builder_ver
+    builder_ver=$(check_builder_image_version "$builder_ref") || return 0
+    [[ -n "$builder_ver" ]] || return 0
+
+    BUILDER_VER="$builder_ver"
+    local assessment
+    assessment=$(assess_version "$pkg" "${builder_ver} (builder)")
+    if [[ "$assessment" == *"FIXED"* || "$assessment" == *"PATCHED"* ]]; then
+        BUILDER_STATUS="fixed"
+    elif [[ "$assessment" == *"VULNERABLE"* ]]; then
+        BUILDER_STATUS="vulnerable"
+    fi
+    printf "  %-24s v%s (builder image)%s\n" "Builder image" "$builder_ver" "$assessment"
+    # Strip tag when digest is present for the skopeo command (same logic as check_builder_image_version)
+    local skopeo_ref="$builder_ref"
+    if [[ "$skopeo_ref" == *@sha256:* ]]; then
+        skopeo_ref="${skopeo_ref%%:*}@${skopeo_ref#*@}"
+    fi
+    vcmd "git show upstream/${branch}:Dockerfile.rhtap | grep golang-builder"
+    vout "${builder_ref}"
+    vcmd "skopeo inspect --config 'docker://${skopeo_ref}' | jq -r '.config.Labels.version'"
+    vout "${builder_ver}"
+}
+
+# Find the latest version tag for a branch (e.g., v0.14.2 for release-0.14).
+# Only matches tags with the same major.minor as the branch name.
+find_latest_tag_for_branch() {
+    local branch="$1"
+    local version_prefix="${branch#release-}"
+    git -C "$REPO_ROOT" tag -l "v${version_prefix}.*" --sort=-v:refname --merged "upstream/${branch}" 2>/dev/null | head -1
+}
+
+# Check if the fix is shipped (included in the latest release tag).
+# For stdlib: compares builder image Go version at the tag vs fix version.
+# Sets SHIPPED_STATUS to "shipped", "not_shipped", or "unreleased".
+check_shipped_status_stdlib() {
+    local branch="$1" pkg="$2"
+    SHIPPED_STATUS="unreleased"
+    SHIPPED_TAG=""
+
+    local tag
+    tag=$(find_latest_tag_for_branch "$branch")
+    if [[ -z "$tag" ]]; then
+        vcmd "git tag -l 'v${branch#release-}.*' --sort=-v:refname --merged upstream/${branch} | head -1"
+        vout "(no tags found)"
+        return
+    fi
+    SHIPPED_TAG="$tag"
+    vcmd "git tag -l 'v${branch#release-}.*' --sort=-v:refname --merged upstream/${branch} | head -1"
+    vout "${tag}"
+
+    local dockerfile_content
+    dockerfile_content=$(git -C "$REPO_ROOT" show "${tag}:Dockerfile.rhtap" 2>/dev/null) || return 0
+
+    local builder_ref
+    builder_ref=$(extract_builder_image_ref "$dockerfile_content")
+    [[ -n "$builder_ref" ]] || return 0
+
+    local builder_ver
+    builder_ver=$(check_builder_image_version "$builder_ref") || return 0
+    [[ -n "$builder_ver" ]] || return 0
+
+    local skopeo_ref="$builder_ref"
+    if [[ "$skopeo_ref" == *@sha256:* ]]; then
+        skopeo_ref="${skopeo_ref%%:*}@${skopeo_ref#*@}"
+    fi
+    vcmd "git show ${tag}:Dockerfile.rhtap | grep golang-builder"
+    vout "${builder_ref}"
+    vcmd "skopeo inspect --config 'docker://${skopeo_ref}' | jq -r '.config.Labels.version'"
+    vout "${builder_ver}"
+
+    local assessment
+    assessment=$(assess_version "$pkg" "${builder_ver} (builder)")
+    if [[ "$assessment" == *"FIXED"* || "$assessment" == *"PATCHED"* ]]; then
+        SHIPPED_STATUS="shipped"
+        vout "${tag} builder Go ${builder_ver} = branch tip Go ${BUILDER_VER} → shipped"
+    else
+        SHIPPED_STATUS="not_shipped"
+        vout "${tag} builder Go ${builder_ver} < branch tip Go ${BUILDER_VER} → not yet shipped"
+    fi
+}
+
+# Check if a non-stdlib fix is shipped by inspecting the dep version at the latest tag.
+# Sets SHIPPED_STATUS to "shipped", "not_shipped", or "unreleased".
+check_shipped_status_dep() {
+    local branch="$1" pkg="$2"
+    SHIPPED_STATUS="unreleased"
+    SHIPPED_TAG=""
+
+    local tag
+    tag=$(find_latest_tag_for_branch "$branch")
+    if [[ -z "$tag" ]]; then
+        vcmd "git tag -l 'v${branch#release-}.*' --sort=-v:refname --merged upstream/${branch} | head -1"
+        vout "(no tags found)"
+        return
+    fi
+    SHIPPED_TAG="$tag"
+    vcmd "git tag -l 'v${branch#release-}.*' --sort=-v:refname --merged upstream/${branch} | head -1"
+    vout "${tag}"
+
+    local any_vulnerable=false
+    local any_found=false
+
+    for entry in "${SUBMODULE_GOMODS[@]}"; do
+        IFS=':' read -r label submod_dir gomod_path <<< "$entry"
+        local submod_commit
+        submod_commit=$(git -C "$REPO_ROOT" ls-tree "${tag}" "${submod_dir}" 2>/dev/null | awk '{print $3}')
+        [[ -n "$submod_commit" ]] || continue
+        local gomod_content
+        gomod_content=$(git -C "${REPO_ROOT}/${submod_dir}" show "${submod_commit}:${gomod_path}" 2>/dev/null) || continue
+        local result
+        result=$(echo "$gomod_content" | search_gomod "$pkg")
+        [[ -n "$result" ]] || continue
+        any_found=true
+        local assessment
+        assessment=$(assess_version "$pkg" "$result")
+        vout "${label} @ ${tag}: ${result}${assessment}"
+        if [[ "$assessment" == *"VULNERABLE"* ]]; then
+            any_vulnerable=true
+        fi
+    done
+
+    if ! $any_found; then
+        return
+    fi
+
+    if $any_vulnerable; then
+        SHIPPED_STATUS="not_shipped"
+    else
+        SHIPPED_STATUS="shipped"
+    fi
 }
 
 # Check if a version falls in an affected range [from, lessThan)
@@ -132,8 +350,16 @@ normalize_version_ranges() {
     echo "$json" | jq -c '[.[] |
         if .lessThan then
             .
+        elif (.version | test("^<=\\s")) then
+            # Parse freeform inclusive: "<= 1.79.3" → {version:"0", lessOrEqual:"1.79.3"}
+            {
+                version: "0",
+                lessOrEqual: (.version | gsub("^<=\\s*"; "")),
+                status: .status,
+                versionType: (.versionType // "semver")
+            }
         elif (.version | test("^[<>]=?\\s")) then
-            # Parse freeform: "< 1.79.3" → {version:"0", lessThan:"1.79.3"}
+            # Parse freeform exclusive: "< 1.79.3" → {version:"0", lessThan:"1.79.3"}
             {
                 version: "0",
                 lessThan: (.version | gsub("^[<>]=?\\s*"; "")),
@@ -149,7 +375,11 @@ normalize_version_ranges() {
 fetch_cve_data() {
     local cve_id="$1"
     echo "Fetching ${cve_id} from cveawg.mitre.org..."
-    CVE_JSON=$(curl -s "${CVE_API}/${cve_id}")
+    CVE_JSON=$(curl -sf "${CVE_API}/${cve_id}" 2>/dev/null) || die "Failed to fetch ${cve_id} (network error or invalid CVE ID)"
+
+    if ! echo "$CVE_JSON" | jq -e '.' >/dev/null 2>&1; then
+        die "Invalid JSON response for ${cve_id}"
+    fi
 
     if echo "$CVE_JSON" | jq -e '.error' >/dev/null 2>&1; then
         die "CVE API error: $(echo "$CVE_JSON" | jq -r '.error')"
@@ -181,7 +411,9 @@ fetch_cve_data() {
             continue
         fi
 
-        if [[ ! "$pkg_name" =~ / ]]; then
+        if is_stdlib_package "$pkg_name"; then
+            echo "  Note: '${pkg_name}' is a Go stdlib package (bundled with the Go toolchain)"
+        elif [[ ! "$pkg_name" =~ / ]]; then
             echo "  WARNING: '${pkg_name}' does not look like a Go module path."
             echo "           Run again with the actual module path, e.g.:"
             echo "           $0 google.golang.org/grpc"
@@ -215,12 +447,15 @@ fetch_cve_data() {
         local num_ranges
         num_ranges=$(echo "$ranges" | jq 'length')
         for j in $(seq 0 $((num_ranges - 1))); do
-            local from lt status
+            local from lt le status
             from=$(echo "$ranges" | jq -r ".[$j].version")
             lt=$(echo "$ranges" | jq -r ".[$j].lessThan // empty")
+            le=$(echo "$ranges" | jq -r ".[$j].lessOrEqual // empty")
             status=$(echo "$ranges" | jq -r ".[$j].status")
             if [[ "$status" == "affected" && -n "$lt" ]]; then
                 echo "  Affected: [${from}, ${lt})"
+            elif [[ "$status" == "affected" && -n "$le" ]]; then
+                echo "  Affected: [${from}, ${le}]"
             elif [[ "$status" == "affected" ]]; then
                 echo "  Affected: ${from}"
             fi
@@ -320,8 +555,11 @@ assess_version() {
 
     local ver
     ver=$(echo "$ver_info" | awk '{print $1}')
-    ver=${ver#=>}  # strip replace arrow if present
-    ver=$(echo "$ver" | xargs)  # trim whitespace
+    if [[ "$ver" == "=>" ]]; then
+        ver=$(echo "$ver_info" | awk '{print $2}')
+    fi
+    ver=${ver#go}  # strip "go" prefix for stdlib versions (e.g., go1.25.0 → 1.25.0)
+    ver=$(strip_v "$ver")
 
     if [[ -z "$ver" || "$ver" == "not" ]]; then
         return
@@ -336,22 +574,33 @@ assess_version() {
     num_ranges=$(echo "$ranges" | jq 'length')
 
     for j in $(seq 0 $((num_ranges - 1))); do
-        local from lt status
+        local from lt le status
         from=$(echo "$ranges" | jq -r ".[$j].version")
-        lt=$(echo "$ranges" | jq -r ".[$j].lessThan")
+        lt=$(echo "$ranges" | jq -r ".[$j].lessThan // empty")
+        le=$(echo "$ranges" | jq -r ".[$j].lessOrEqual // empty")
         status=$(echo "$ranges" | jq -r ".[$j].status")
 
-        if [[ "$status" == "affected" ]] && is_version_affected "$ver" "$from" "$lt"; then
+        local affected=false
+        if [[ "$status" == "affected" && -n "$lt" ]] && is_version_affected "$ver" "$from" "$lt"; then
+            affected=true
+        elif [[ "$status" == "affected" && -n "$le" ]]; then
+            ver=$(strip_v "$ver"); from=$(strip_v "$from"); le=$(strip_v "$le")
+            if version_le "$from" "$ver" && version_le "$ver" "$le"; then
+                affected=true
+            fi
+        fi
+
+        if $affected; then
             if echo "$ver_info" | grep -q "(replace)"; then
-                printf "  ✓ PATCHED"
+                printf "  ${GREEN}✓ PATCHED${RESET}"
             else
-                printf "  ⚠ VULNERABLE"
+                printf "  ${RED}⚠ VULNERABLE${RESET}"
             fi
             return
         fi
     done
 
-    printf "  ✓ FIXED"
+    printf "  ${GREEN}✓ FIXED${RESET}"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -380,6 +629,7 @@ Branch selection (default: auto-detect active branches via .tekton/):
 
 Other options:
   --no-fetch        Skip fetching upstream and submodules
+  -v, --verbose     Show evidence (commands + outputs) behind each determination
   -h, --help        Show this help
 
 Workflow:
@@ -405,14 +655,66 @@ Example output (CVE mode):
     volsync                  v0.49.0 (indirect)   ✓ FIXED
     rclone                   v0.47.0 (direct)     ✓ FIXED
     CVE-patch/rclone         v0.48.0 (direct)     ✓ FIXED
+    Release status           ✓ SHIPPED (v0.15.1)
 
   If any submodule shows ⚠ VULNERABLE, run:
     ./hack/cve-triage.sh --submodule <name> <CVE-ID>
+
+Example output (CVE mode, stdlib package, builder fixed):
+
+  --- release-0.15 ---
+    Builder image            v1.25.9 (builder image)  ✓ FIXED
+    Release status           ✓ SHIPPED (v0.15.1)
+
+Example output (CVE mode, stdlib package, builder fixed but not shipped):
+
+  --- release-0.16 ---
+    Builder image            v1.25.9 (builder image)  ✓ FIXED
+    Release status           ⏳ NOT YET SHIPPED (no release tag found)
 USAGE
     exit 0
 }
 
 # ── per-input processing ───────────────────────────────────────────────────
+
+# Check a single package against a single go.mod's content.
+# Args: input_mode label pkg gomod_content missing_label
+#   missing_label: what to print when gomod_content is empty (e.g., "not found (no go.mod)" or "n/a")
+check_pkg_in_gomod() {
+    local input_mode="$1" label="$2" pkg="$3" gomod_content="$4" missing_label="$5"
+
+    if [[ -z "$gomod_content" ]]; then
+        printf "  %-24s ${DIM}%s${RESET}\n" "$label" "$missing_label"
+        return
+    fi
+
+    if is_stdlib_package "$pkg"; then
+        local go_ver
+        go_ver=$(echo "$gomod_content" | extract_go_version)
+        if [[ -n "$go_ver" ]]; then
+            local assessment=""
+            if [[ "$input_mode" == "cve" ]]; then
+                assessment=$(assess_version "$pkg" "go${go_ver} (stdlib)")
+            fi
+            printf "  %-24s go%s (stdlib)%s\n" "$label" "$go_ver" "$assessment"
+        else
+            printf "  %-24s ${DIM}unknown go version${RESET}\n" "$label"
+        fi
+    else
+        local result
+        result=$(echo "$gomod_content" | search_gomod "$pkg")
+
+        if [[ -n "$result" ]]; then
+            local assessment=""
+            if [[ "$input_mode" == "cve" ]]; then
+                assessment=$(assess_version "$pkg" "$result")
+            fi
+            printf "  %-24s %s%s\n" "$label" "$result" "$assessment"
+        else
+            printf "  %-24s ${DIM}not found${RESET}\n" "$label"
+        fi
+    fi
+}
 
 check_branches_for_packages() {
     local input_mode="$1"
@@ -423,12 +725,44 @@ check_branches_for_packages() {
         branch=$(echo "$branch" | xargs)
 
         if ! git -C "$REPO_ROOT" rev-parse "upstream/${branch}" >/dev/null 2>&1; then
-            echo "--- ${branch} --- (NOT FOUND on upstream, skipping)"
+            echo -e "${DIM}--- ${branch} --- (NOT FOUND on upstream, skipping)${RESET}"
             echo ""
             continue
         fi
 
-        echo "--- ${branch} ---"
+        echo -e "${BOLD}--- ${branch} ---${RESET}"
+
+        # For stdlib CVEs, check the builder image first — if FIXED, the
+        # individual go.mod versions are irrelevant (they're minimums, not
+        # the actual compiler version).
+        local stdlib_builder_fixed=false
+        local is_stdlib_cve=false
+        if [[ "$input_mode" == "cve" ]]; then
+            for pkg in "${pkgs[@]}"; do
+                if is_stdlib_package "$pkg"; then
+                    is_stdlib_cve=true
+                    check_builder_for_branch "$branch" "$pkg"
+                    if [[ "$BUILDER_STATUS" == "fixed" ]]; then
+                        stdlib_builder_fixed=true
+                        check_shipped_status_stdlib "$branch" "$pkg"
+                        case "$SHIPPED_STATUS" in
+                            shipped)
+                                printf "  %-24s ${GREEN}%s${RESET}\n" "Release status" "✓ SHIPPED (${SHIPPED_TAG})" ;;
+                            not_shipped)
+                                printf "  %-24s ${YELLOW}%s${RESET}\n" "Release status" "⏳ NOT YET SHIPPED (fix is on branch, latest release is ${SHIPPED_TAG})" ;;
+                            unreleased)
+                                printf "  %-24s ${YELLOW}%s${RESET}\n" "Release status" "⏳ NOT YET SHIPPED (no release tag found)" ;;
+                        esac
+                    fi
+                    break
+                fi
+            done
+        fi
+
+        if $stdlib_builder_fixed; then
+            echo ""
+            continue
+        fi
 
         for pkg in "${pkgs[@]}"; do
             if [[ ${#pkgs[@]} -gt 1 ]]; then
@@ -437,56 +771,39 @@ check_branches_for_packages() {
 
             for entry in "${SUBMODULE_GOMODS[@]}"; do
                 IFS=':' read -r label submod_dir gomod_path <<< "$entry"
-
-                local gomod_content result
+                local gomod_content
                 gomod_content=$(read_submodule_gomod "$branch" "$submod_dir" "$gomod_path" 2>/dev/null || true)
-
-                if [[ -z "$gomod_content" ]]; then
-                    printf "  %-24s not found (no go.mod)\n" "$label"
-                    continue
-                fi
-
-                result=$(echo "$gomod_content" | search_gomod "$pkg")
-
-                if [[ -n "$result" ]]; then
-                    local assessment=""
-                    if [[ "$input_mode" == "cve" ]]; then
-                        assessment=$(assess_version "$pkg" "$result")
-                    fi
-                    printf "  %-24s %s%s\n" "$label" "$result" "$assessment"
-                else
-                    printf "  %-24s not found\n" "$label"
-                fi
+                check_pkg_in_gomod "$input_mode" "$label" "$pkg" "$gomod_content" "not found (no go.mod)"
             done
 
             for entry in "${PATCH_GOMODS[@]}"; do
                 IFS=':' read -r label path <<< "$entry"
-
-                local gomod_content result
+                local gomod_content
                 gomod_content=$(read_patch_gomod "$branch" "$path" 2>/dev/null || true)
-
-                if [[ -z "$gomod_content" ]]; then
-                    printf "  %-24s n/a\n" "$label"
-                    continue
-                fi
-
-                result=$(echo "$gomod_content" | search_gomod "$pkg")
-
-                if [[ -n "$result" ]]; then
-                    local assessment=""
-                    if [[ "$input_mode" == "cve" ]]; then
-                        assessment=$(assess_version "$pkg" "$result")
-                    fi
-                    printf "  %-24s %s%s\n" "$label" "$result" "$assessment"
-                else
-                    printf "  %-24s not found\n" "$label"
-                fi
+                check_pkg_in_gomod "$input_mode" "$label" "$pkg" "$gomod_content" "n/a"
             done
         done
+
+        # For non-stdlib CVEs, check shipped status after showing dep versions
+        if [[ "$input_mode" == "cve" ]] && ! $is_stdlib_cve; then
+            for pkg in "${pkgs[@]}"; do
+                check_shipped_status_dep "$branch" "$pkg"
+                case "$SHIPPED_STATUS" in
+                    shipped)
+                        printf "  %-24s ${GREEN}%s${RESET}\n" "Release status" "✓ SHIPPED (${SHIPPED_TAG})" ;;
+                    not_shipped)
+                        printf "  %-24s ${YELLOW}%s${RESET}\n" "Release status" "⏳ NOT YET SHIPPED (fix is on branch, latest release is ${SHIPPED_TAG})" ;;
+                    unreleased)
+                        printf "  %-24s ${YELLOW}%s${RESET}\n" "Release status" "⏳ NOT YET SHIPPED (no release tag found)" ;;
+                esac
+                break
+            done
+        fi
 
         echo ""
     done
 }
+
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
@@ -527,6 +844,10 @@ main() {
                 ;;
             --no-fetch)
                 do_fetch=false
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
                 shift
                 ;;
             -h|--help)
@@ -575,8 +896,29 @@ main() {
         fetch_cve_data "$cve_id"
         check_branches_for_packages "cve" "${PACKAGES[@]}"
 
+        # Add stdlib fix guidance
+        local has_stdlib=false
+        for pkg in "${PACKAGES[@]}"; do
+            if is_stdlib_package "$pkg"; then
+                has_stdlib=true
+                break
+            fi
+        done
+
+        if $has_stdlib; then
+            echo -e "  ${DIM}Note: '${pkg}' is part of the Go standard library.${RESET}"
+            echo -e "  ${DIM}Fix: update the Go builder image in the Dockerfile, then rebuild.${RESET}"
+            echo -e "  ${DIM}Individual go.mod files do NOT need to be changed.${RESET}"
+            echo ""
+        fi
+
+        if ! $VERBOSE; then
+            echo -e "  ${DIM}Tip: re-run with -v to see the commands and outputs behind each determination.${RESET}"
+        fi
+        echo ""
+
         # Suggest follow-up
-        echo "  Next step: ./hack/cve-triage.sh ${cve_id}"
+        echo -e "  Next step: ${BOLD}./hack/cve-triage.sh ${cve_id}${RESET}"
         echo ""
     done
 
