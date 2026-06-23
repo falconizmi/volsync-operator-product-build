@@ -591,11 +591,7 @@ assess_version() {
         fi
 
         if $affected; then
-            if echo "$ver_info" | grep -q "(replace)"; then
-                printf "  ${GREEN}✓ PATCHED${RESET}"
-            else
-                printf "  ${RED}⚠ VULNERABLE${RESET}"
-            fi
+            printf "  ${RED}⚠ VULNERABLE${RESET}"
             return
         fi
     done
