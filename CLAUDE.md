@@ -63,6 +63,10 @@ Use the tool-aware fallback chain: ~/.config/opencode/user.local.md (OpenCode),
 If none exist, fall back to agent memory (`user-config`), then placeholders.
 Run `make personalize` to generate all three files (if this repo uses Fleet Engineering tooling).
 
+## CVE triage
+
+When given a CVE ID and Jira ticket links, read `hack/CLAUDE.md` for the full triage workflow and Jira comment templates before doing anything else.
+
 ## Fleet Engineering Skills
 
 All skills are available as slash commands. See the [Fleet Engineering skills catalog](https://github.com/OpenShift-Fleet/agentic-sdlc/blob/main/skills/README.md) for the full list with when-to-use guidance.
