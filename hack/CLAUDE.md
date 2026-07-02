@@ -8,7 +8,7 @@ Do not mark the triage as complete until the test task is done.
 
 ## Step 1 — Run the triage script
 
-Run `hack/cve-triage.sh <CVE-ID>` (without `--no-fetch` to ensure branches are up to date). Use `-v` for verbose output when deeper investigation is needed. Verify every detail of the output: which branches are active, which submodules import the vulnerable package, what versions they have, and whether they fall within the CVE bounds.
+Run `hack/cve-triage.sh <CVE-ID>`. Use `-v` for verbose output when deeper investigation is needed. Verify every detail of the output: which branches are active, which submodules import the vulnerable package, what versions they have, and whether they fall within the CVE bounds.
 
 ## Step 2 — Investigate reachability
 
